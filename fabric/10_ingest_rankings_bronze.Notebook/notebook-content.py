@@ -263,6 +263,98 @@ def collect(source, credentials, run_id, batch_id, opener=urlopen, sleeper=time.
 
 # CELL ********************
 
+# 入力フォームまたはKey Vaultから認証情報を読み取り、フォームの値を消去する。
+if CREDENTIAL_MODE == "interactive":
+    credentials = {name: credential_inputs[name].value.strip() for name in required_names}
+    for widget in credential_inputs.values():
+        widget.value = ""
+        widget.close()
+else:
+    if not KEY_VAULT_URL:
+        raise ValueError("KEY_VAULT_URLが未設定です。")
+    credentials = {name: notebookutils.credentials.getSecret(KEY_VAULT_URL, SECRET_NAMES[name])
+                   for name in required_names}
+missing = [name for name in required_names if not credentials.get(name)]
+if missing:
+    raise ValueError(f"認証情報が未入力です: {missing}")
+print("認証情報を読み取りました。")
+
+
+# METADATA ********************
+
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
+
+# CELL ********************
+
+import uuid
+
+RESPONSE_KEYS = ["run_id", "source", "request_page"]
+RUN_KEYS = ["batch_id", "run_id", "source"]
+
+
+def merge_rows(table, rows, schema, keys):
+    if not rows:
+        return
+    struct = spark.createDataFrame([], schema).schema
+    df = spark.createDataFrame([tuple(r[f] for f in struct.fieldNames()) for r in rows], struct)
+    condition = " AND ".join(f"t.{k} = s.{k}" for k in keys)
+    (DeltaTable.forName(spark, table).alias("t")
+        .merge(df.alias("s"), condition)
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute())
+
+
+batch_id = COLLECTION_BATCH_ID or uuid.uuid4().hex
+results = {}
+for source in SOURCES:
+    previous = {r["status"]: r["bronze_stored"] for r in spark.table(AUDIT_TABLE)
+                .where((F.col("batch_id") == batch_id) & (F.col("source") == source))
+                .select("status", "bronze_stored").collect()}
+    if previous.get("SUCCESS"):
+        print(f"{source}: batch_id={batch_id} は取得済みのためスキップします。")
+        results[source] = "SKIPPED"
+        continue
+    if previous:
+        raise RuntimeError(f"{source}: batch_id={batch_id} に完了していない実行があります"
+                           f"（{sorted(previous)}）。COLLECTION_BATCH_IDを空欄に戻して取り直してください。")
+
+    run_id = uuid.uuid4().hex
+    started = utc_now()
+    merge_rows(AUDIT_TABLE, [{"batch_id": batch_id, "run_id": run_id, "source": source,
+                              "request_scope": None, "started_at": started, "finished_at": None,
+                              "status": "RUNNING", "last_http_status": None, "received_pages": 0,
+                              "record_count": 0, "error_code": None, "bronze_stored": False}],
+               RUN_SCHEMA, RUN_KEYS)
+    response_rows, audit = collect(source, credentials, run_id, batch_id)
+    audit["started_at"] = started
+    merge_rows(TABLES[source], response_rows, RESPONSE_SCHEMA, RESPONSE_KEYS)
+    audit["bronze_stored"] = len(response_rows) > 0
+    merge_rows(AUDIT_TABLE, [audit], RUN_SCHEMA, RUN_KEYS)
+    results[source] = audit["status"]
+    print(f"{source}: status={audit['status']} pages={audit['received_pages']} "
+          f"records={audit['record_count']} error={audit['error_code']}")
+
+del credentials
+COLLECTION_BATCH_ID = batch_id  # 後続の確認セル用
+display(spark.table(AUDIT_TABLE).where(F.col("batch_id") == batch_id).orderBy("source"))
+failed = [s for s, status in results.items() if status not in {"SUCCESS", "SKIPPED"}]
+if failed:
+    raise RuntimeError(f"正常に完了していない取得元があります: {failed}")
+
+
+# METADATA ********************
+
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
+
+# CELL ********************
+
 # 実際に保存したYahoo!データをSpark SQLで確認する。テーブルは作成しない。
 if "yahoo" in SOURCES:
     (spark.table(TABLES["yahoo"])
