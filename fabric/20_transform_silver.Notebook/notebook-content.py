@@ -48,8 +48,7 @@ def check(name, sql):
 
 # Yahoo：未処理runの検索語ランキングを1行1順位に展開する。
 # 数値は文字列で読んでから型変換する。日付はタイムゾーン表記がないため、日本の暦日としてDATEで保持する。
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW yahoo_new AS
+yahoo_new = spark.sql("""
 WITH done AS (   -- 変換済みのrun（解釈済み日付が空のrunは再処理して埋める）
     SELECT DISTINCT run_id FROM lh_ec_silver.dbo.silver_yahoo_keyword_rank
     WHERE source_updated_date IS NOT NULL OR source_updated_at_raw IS NULL
@@ -80,7 +79,10 @@ SELECT batch_id, run_id, observed_at,
 FROM parsed
 LATERAL VIEW explode(data.keyword_ranking.ranking_data) t AS item
 """)
-spark.sql("CACHE TABLE yahoo_new")  # 検査とMERGEで同じ内容を使うため固定する
+# SQLで作る一時ビューは参照のたびに名前を解決し直し、Fabricの3段名（lakehouse.schema.table）を解決できない。
+# そのため結果をキャッシュし、解決済みのDataFrameとして一時ビューに登録する。
+yahoo_new.cache()  # 検査とMERGEで同じ内容を使うため固定する
+yahoo_new.createOrReplaceTempView("yahoo_new")
 
 check("Yahoo：順位が空の行がある", "SELECT run_id FROM yahoo_new WHERE rank IS NULL")
 check("Yahoo：同じrunで順位が重複", "SELECT run_id, rank, count(*) AS n FROM yahoo_new GROUP BY run_id, rank HAVING n > 1")
@@ -105,7 +107,7 @@ ON t.run_id = s.run_id AND t.rank = s.rank
 WHEN MATCHED THEN UPDATE SET *
 WHEN NOT MATCHED THEN INSERT *
 """)
-spark.sql("UNCACHE TABLE yahoo_new")
+yahoo_new.unpersist()
 
 # METADATA ********************
 
@@ -118,8 +120,7 @@ spark.sql("UNCACHE TABLE yahoo_new")
 
 # 楽天：未処理runの商品ランキングを1行1順位に展開し、100位までに絞る。
 # lastBuildDateはRFC 1123形式（例 "Fri, 09 Oct 2026 00:00:00 +0900"）。曜日を除いて解釈し、UTCで保持する。
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW rakuten_new AS
+rakuten_new = spark.sql("""
 WITH done AS (
     SELECT DISTINCT run_id FROM lh_ec_silver.dbo.silver_rakuten_item_rank
     WHERE source_updated_at IS NOT NULL OR source_updated_at_raw IS NULL
@@ -162,7 +163,8 @@ SELECT *,
 FROM items
 WHERE rank IS NULL OR rank <= 100
 """)
-spark.sql("CACHE TABLE rakuten_new")
+rakuten_new.cache()
+rakuten_new.createOrReplaceTempView("rakuten_new")
 
 check("楽天：順位が空の行がある", "SELECT run_id FROM rakuten_new WHERE rank IS NULL")
 check("楽天：同じrunで順位が重複", "SELECT run_id, rank, count(*) AS n FROM rakuten_new GROUP BY run_id, rank HAVING n > 1")
@@ -184,7 +186,7 @@ ON t.run_id = s.run_id AND t.rank = s.rank
 WHEN MATCHED THEN UPDATE SET *
 WHEN NOT MATCHED THEN INSERT *
 """)
-spark.sql("UNCACHE TABLE rakuten_new")
+rakuten_new.unpersist()
 
 # METADATA ********************
 
