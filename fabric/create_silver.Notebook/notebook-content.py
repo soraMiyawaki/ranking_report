@@ -48,7 +48,10 @@ CREATE TABLE IF NOT EXISTS lh_ec_silver.dbo.silver_yahoo_keyword_rank (
     keyword STRING,
     previous_rank INT,
     direction STRING,
-    processed_at TIMESTAMP
+    processed_at TIMESTAMP,
+    source_updated_date DATE,
+    source_period_start_date DATE,
+    source_period_end_date DATE
 ) USING DELTA
 """)
 
@@ -82,10 +85,42 @@ CREATE TABLE IF NOT EXISTS lh_ec_silver.dbo.silver_rakuten_item_rank (
     postage_flag INT,
     availability INT,
     item_url STRING,
-    processed_at TIMESTAMP
+    processed_at TIMESTAMP,
+    source_updated_at TIMESTAMP
 ) USING DELTA
 """)
 
+
+# METADATA ********************
+
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
+
+# CELL ********************
+
+# 列追加（2026-10-10）：提供元日時の解釈済み列。作成済みテーブルにも無ければ追加する。
+# Yahoo：日付のみ（タイムゾーン表記なし）。日本の暦日としてDATEで保持する。
+# 楽天：RFC 1123形式（例 "Fri, 09 Oct 2026 00:00:00 +0900"）。UTCのTIMESTAMPで保持する。
+NEW_COLUMNS = {
+    "lh_ec_silver.dbo.silver_yahoo_keyword_rank": [
+        ("source_updated_date", "DATE"),
+        ("source_period_start_date", "DATE"),
+        ("source_period_end_date", "DATE"),
+    ],
+    "lh_ec_silver.dbo.silver_rakuten_item_rank": [
+        ("source_updated_at", "TIMESTAMP"),
+    ],
+}
+for table, columns in NEW_COLUMNS.items():
+    existing = set(spark.table(table).columns)
+    missing = [f"{name} {dtype}" for name, dtype in columns if name not in existing]
+    if missing:
+        spark.sql(f"ALTER TABLE {table} ADD COLUMNS ({', '.join(missing)})")
+        print(f"{table}: 追加 {missing}")
+    else:
+        print(f"{table}: 追加なし")
 
 # METADATA ********************
 

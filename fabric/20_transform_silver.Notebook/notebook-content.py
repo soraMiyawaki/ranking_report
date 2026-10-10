@@ -49,15 +49,27 @@ for table in [YAHOO_TABLE, RAKUTEN_TABLE]:
         raise RuntimeError(f"{table}が未作成です。create_silverを先に実行してください。")
 
 
-def pending_responses(source, bronze_table, silver_table):
-    """Silverへ未処理の成功runについて、HTTP 200の応答ページを返す。"""
+def pending_responses(source, bronze_table, silver_table, parsed_column):
+    """Silverへ未処理の成功run（解釈済み日時が未設定のrunを含む）について、HTTP 200の応答ページを返す。"""
+    done = (spark.table(silver_table)
+            .where(F.col(parsed_column).isNotNull() | F.col("source_updated_at_raw").isNull())
+            .select("run_id").distinct())
     runs = (spark.table(f"{BRONZE}.ops_collection_run")
             .where((F.col("source") == source) & (F.col("status") == "SUCCESS") & F.col("bronze_stored"))
             .select("run_id")
-            .join(spark.table(silver_table).select("run_id").distinct(), "run_id", "left_anti"))
+            .join(done, "run_id", "left_anti"))
     return (spark.table(f"{BRONZE}.{bronze_table}")
             .where(F.col("http_status") == 200)
             .join(runs, "run_id"))
+
+
+def parse_failed(df, pairs):
+    """原文があるのに解釈できなかった日時を返す。"""
+    cond = None
+    for raw, parsed in pairs:
+        c = F.col(raw).isNotNull() & F.col(parsed).isNull()
+        cond = c if cond is None else (cond | c)
+    return df.where(cond).select(*[raw for raw, _ in pairs]).distinct().limit(5).collect()
 
 
 def merge_silver(table, df):
@@ -95,7 +107,7 @@ def report(table, df, max_rank):
 # Yahoo：検索語ランキングを1行1順位に展開する。数値はSTRINGで読み、明示的に変換する。
 YAHOO_SCHEMA = ("STRUCT<keyword_ranking:STRUCT<ranking_data:ARRAY<"
                 "STRUCT<rank:STRING,query:STRING,pre_rank:STRING,vector:STRING>>>>")
-yahoo = (pending_responses("yahoo", "bronze_yahoo_api_response", YAHOO_TABLE)
+yahoo = (pending_responses("yahoo", "bronze_yahoo_api_response", YAHOO_TABLE, "source_updated_date")
          .withColumn("data", F.from_json("response_body", YAHOO_SCHEMA))
          .select("batch_id", "run_id", "observed_at", "source_updated_at_raw",
                  "source_period_start_raw", "source_period_end_raw",
@@ -106,7 +118,16 @@ yahoo = (pending_responses("yahoo", "bronze_yahoo_api_response", YAHOO_TABLE)
                  F.col("item.query").alias("keyword"),
                  F.col("item.pre_rank").cast("int").alias("previous_rank"),
                  F.col("item.vector").alias("direction"))
+         # 日付のみでタイムゾーン表記がないため、日本の暦日としてDATEで保持する。
+         .withColumn("source_updated_date", F.to_date("source_updated_at_raw", "yyyy-MM-dd"))
+         .withColumn("source_period_start_date", F.to_date("source_period_start_raw", "yyyy-MM-dd"))
+         .withColumn("source_period_end_date", F.to_date("source_period_end_raw", "yyyy-MM-dd"))
          .cache())
+failed = parse_failed(yahoo, [("source_updated_at_raw", "source_updated_date"),
+                              ("source_period_start_raw", "source_period_start_date"),
+                              ("source_period_end_raw", "source_period_end_date")])
+if failed:
+    raise RuntimeError(f"Yahooの日付を解釈できません: {failed}")
 report(YAHOO_TABLE, yahoo, 100)
 merge_silver(YAHOO_TABLE, yahoo)
 yahoo.unpersist()
@@ -125,7 +146,7 @@ yahoo.unpersist()
 RAKUTEN_FIELDS = ["rank", "itemCode", "itemName", "itemPrice", "shopCode", "shopName", "genreId",
                   "reviewCount", "reviewAverage", "pointRate", "postageFlag", "availability", "itemUrl"]
 RAKUTEN_SCHEMA = "STRUCT<Items:ARRAY<STRUCT<" + ",".join(f"{f}:STRING" for f in RAKUTEN_FIELDS) + ">>>"
-rakuten = (pending_responses("rakuten", "bronze_rakuten_api_response", RAKUTEN_TABLE)
+rakuten = (pending_responses("rakuten", "bronze_rakuten_api_response", RAKUTEN_TABLE, "source_updated_at")
            .withColumn("data", F.from_json("response_body", RAKUTEN_SCHEMA))
            .select("batch_id", "run_id", "observed_at", "source_updated_at_raw",
                    F.explode("data.Items").alias("item"))
@@ -144,7 +165,13 @@ rakuten = (pending_responses("rakuten", "bronze_rakuten_api_response", RAKUTEN_T
                    F.col("item.availability").cast("int").alias("availability"),
                    F.col("item.itemUrl").alias("item_url"))
            .where(F.col("rank").isNull() | (F.col("rank") <= RAKUTEN_MAX_RANK))
+           # RFC 1123形式（例 "Fri, 09 Oct 2026 00:00:00 +0900"）。曜日を除いて解釈し、UTCで保持する。
+           .withColumn("source_updated_at", F.to_timestamp(
+               F.regexp_replace("source_updated_at_raw", r"^[A-Za-z]{3}, ", ""), "dd MMM yyyy HH:mm:ss Z"))
            .cache())
+failed = parse_failed(rakuten, [("source_updated_at_raw", "source_updated_at")])
+if failed:
+    raise RuntimeError(f"楽天のlastBuildDateを解釈できません: {failed}")
 report(RAKUTEN_TABLE, rakuten, RAKUTEN_MAX_RANK)
 merge_silver(RAKUTEN_TABLE, rakuten)
 rakuten.unpersist()
@@ -162,7 +189,8 @@ rakuten.unpersist()
 # 処理結果の確認：Silverのrunごとの件数。
 for table in [YAHOO_TABLE, RAKUTEN_TABLE]:
     print(table)
-    display(spark.table(table).groupBy("batch_id", "run_id", "source_updated_at_raw")
+    updated = "source_updated_date" if table == YAHOO_TABLE else "source_updated_at"
+    display(spark.table(table).groupBy("batch_id", "run_id", "source_updated_at_raw", updated)
             .agg(F.count("*").alias("rows"), F.min("rank").alias("min_rank"), F.max("rank").alias("max_rank"))
             .orderBy(F.col("batch_id")))
 
