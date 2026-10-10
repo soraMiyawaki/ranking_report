@@ -325,6 +325,8 @@ def merge_rows(table, rows, schema, keys):
         .execute())
 
 
+if "credentials" not in globals():
+    raise RuntimeError("認証情報が未読み取りです。入力フォームのセルから順に実行し直してください。")
 batch_id = COLLECTION_BATCH_ID or uuid.uuid4().hex
 results = {}
 for source in SOURCES:
@@ -355,8 +357,8 @@ for source in SOURCES:
     print(f"{source}: status={audit['status']} pages={audit['received_pages']} "
           f"records={audit['record_count']} error={audit['error_code']}")
 
-del credentials
-COLLECTION_BATCH_ID = batch_id  # 後続の確認セル用
+del credentials  # 認証情報は実行ごとに読み直す
+LAST_BATCH_ID = batch_id  # 後続の確認セル用。COLLECTION_BATCH_IDは書き換えない
 display(spark.table(AUDIT_TABLE).where(F.col("batch_id") == batch_id).orderBy("source"))
 failed = [s for s, status in results.items() if status not in {"SUCCESS", "SKIPPED"}]
 if failed:
@@ -375,7 +377,7 @@ if failed:
 # 実際に保存したYahoo!データをSpark SQLで確認する。テーブルは作成しない。
 if "yahoo" in SOURCES:
     (spark.table(TABLES["yahoo"])
-        .where(F.col("batch_id") == COLLECTION_BATCH_ID)
+        .where(F.col("batch_id") == LAST_BATCH_ID)
         .createOrReplaceTempView("current_yahoo_response"))
     display(spark.sql("""
         WITH parsed AS (
@@ -394,7 +396,7 @@ if "yahoo" in SOURCES:
 
 if "rakuten" in SOURCES:
     display(spark.table(TABLES["rakuten"])
-        .where(F.col("batch_id") == COLLECTION_BATCH_ID)
+        .where(F.col("batch_id") == LAST_BATCH_ID)
         .select("run_id", "request_page", "record_count", "source_updated_at_raw", "observed_at")
         .orderBy("request_page"))
 
