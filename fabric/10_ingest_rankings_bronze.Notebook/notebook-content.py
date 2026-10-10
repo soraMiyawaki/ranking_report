@@ -121,10 +121,11 @@ from urllib.error import HTTPError, URLError
 
 
 class IngestError(Exception):
-    def __init__(self, code, http_status=None):
+    def __init__(self, code, http_status=None, body=None):
         super().__init__(code)
         self.code = code
         self.http_status = http_status
+        self.body = body  # エラー応答の本文（原因調査用にBronzeへ残す）
 
 
 def utc_now():
@@ -162,9 +163,13 @@ def fetch(endpoint, params, headers, opener=urlopen, sleeper=time.sleep):
         except HTTPError as exc:
             status = exc.code
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                error_body = exc.read().decode("utf-8-sig", errors="replace")
+            except Exception:
+                error_body = None
             exc.close()
             if status not in {429, 500, 502, 503, 504} or attempt == 2:
-                raise IngestError(f"http_{status}", status) from None
+                raise IngestError(f"http_{status}", status, error_body) from None
             delay = float(2 ** attempt)
             if retry_after:
                 try:
@@ -244,6 +249,18 @@ def collect(source, credentials, run_id, batch_id, opener=urlopen, sleeper=time.
         status, code = "FAILED", exc.code
         if exc.http_status is not None:
             last_status = exc.http_status
+        if exc.body is not None:
+            # HTTPエラーの応答本文も原文として残す。認証情報が含まれていれば伏せる。
+            body = exc.body
+            for secret in credentials.values():
+                if secret:
+                    body = body.replace(secret, "***")
+            response_rows.append({"batch_id": batch_id, "run_id": run_id, "source": source,
+                                  "request_scope": scope, "request_page": page,
+                                  "observed_at": utc_now(), "http_status": exc.http_status,
+                                  "source_updated_at_raw": None, "source_period_start_raw": None,
+                                  "source_period_end_raw": None, "record_count": None,
+                                  "response_body": body})
     finished = utc_now()
     audit = {"batch_id": batch_id, "run_id": run_id, "source": source,
              "request_scope": scope, "started_at": started, "finished_at": finished,
